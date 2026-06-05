@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geolip-sd-trainer"
+version = "0.1.0"
+description = "Pure-PyTorch SDXL trainer with Qwen-pooled + aleph conditioning on the Lune rectified-flow objective"
+readme = "README_github.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AbstractPhil" }]
+keywords = ["sdxl", "rectified-flow", "lune", "qwen", "aleph", "geolip", "diffusion"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.7",
+    "numpy>=1.24",
+    "safetensors>=0.4.3",
+    "tqdm>=4.66",
+    "Pillow>=10.0",
+    "transformers>=5.2.0",   # Qwen3.5 needs transformers v5 (4.x will not load it)
+    "torchvision>=0.22",
+    "datasets>=2.19",
+    "huggingface_hub>=0.26",
+    "clean-fid>=0.1.35",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/AbstractEyes/geolip-sd-trainer"
+Repository = "https://github.com/AbstractEyes/geolip-sd-trainer"
+
+[tool.setuptools.packages.find]
+include = ["geolip_sd_trainer*"]
+
+[tool.setuptools.package-data]
+geolip_sd_trainer = ["**/*.md"]

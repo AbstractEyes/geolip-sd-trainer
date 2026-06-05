@@ -1,0 +1,25 @@
+# geolip-sd-trainer runtime requirements
+# Pure-PyTorch SDXL: the UNet / VAE / CLIP-L / CLIP-G are reimplemented natively,
+# so diffusers is NOT a runtime dependency. transformers is needed only for the
+# frozen Qwen text encoder and the CLIP tokenizers.
+
+# --- core ---
+torch>=2.7            # Blackwell (sm_120) needs a build for CUDA 12.8 (cu128)
+numpy>=1.24
+safetensors>=0.4.3
+tqdm>=4.66
+Pillow>=10.0
+
+# --- Qwen text encoder + CLIP tokenizers ---
+# Qwen3.5 requires transformers v5 — 4.x will NOT load it. The 0.8B is floored at
+# >=5.2.0; Qwen3.5 is a unified VLM, so torchvision + Pillow are required even for
+# text-only pooled encoding.
+transformers>=5.2.0
+torchvision>=0.22
+
+# --- data + hub ---
+datasets>=2.19        # streaming .iter(batch_size=...) + .take()
+huggingface_hub>=0.26 # upload_large_folder, create_repo, whoami
+
+# --- evaluation (FID/KID safeguards) ---
+clean-fid>=0.1.35

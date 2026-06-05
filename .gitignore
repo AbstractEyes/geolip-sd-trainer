@@ -1,0 +1,49 @@
+# --- byte-compiled / caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- environments ---
+.venv/
+venv/
+env/
+.python-version
+
+# --- notebooks ---
+.ipynb_checkpoints/
+
+# --- build / packaging ---
+build/
+dist/
+*.egg-info/
+*.egg
+
+# --- secrets / tokens (never commit) ---
+.env
+*.token
+hf_token*
+
+# --- trainer outputs & cached features ---
+phase1_cache/
+phase1_runs/
+*_cache/
+fid_ref/
+samples/
+
+# --- large artifacts (checkpoints, exports, feature shards) ---
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.npy
+*.npz
+
+# --- logs ---
+*.log
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
