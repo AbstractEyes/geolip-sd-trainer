@@ -260,11 +260,13 @@ class GeolipSDXL:
     # -- owned interface --
     @torch.no_grad()
     def vae_encode_latent(self, images: torch.Tensor, generator=None) -> torch.Tensor:
-        return self.vae.encode(images).sample(generator) * self.cfg.vae_scale
+        vdt = next(self.vae.parameters()).dtype
+        return self.vae.encode(images.to(vdt)).sample(generator) * self.cfg.vae_scale
 
     @torch.no_grad()
     def vae_decode_latent(self, z: torch.Tensor) -> torch.Tensor:
-        return self.vae.decode(z / self.cfg.vae_scale)
+        vdt = next(self.vae.parameters()).dtype
+        return self.vae.decode((z / self.cfg.vae_scale).to(vdt))
 
     @torch.no_grad()
     def encode_clip_l(self, captions) -> torch.Tensor:
