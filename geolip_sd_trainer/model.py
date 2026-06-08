@@ -25,6 +25,7 @@ Author: AbstractPhil + Mirel | License: MIT
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -99,7 +100,11 @@ class ComponentConfig:
     qwen: QwenConfig = field(default_factory=QwenConfig)
     variant: str = "fp16"                       # checkpoint file variant to pull
     dtype: str = "bf16"                         # UNet / CLIP / Qwen compute dtype
-    vae_dtype: str = "fp32"                     # VAE unstable in fp16 -> fp32
+    # VAE is unstable in *fp16* only (5-bit exponent overflows SDXL VAE activations).
+    # bf16 has the fp32 exponent range and is safe for frozen encode/decode — set
+    # vae_dtype="bf16" for ~2x faster, half-memory precompute once you've run the
+    # latent-parity check (cache stores fp16 either way, so no precision is lost).
+    vae_dtype: str = "fp32"
     device: str = "cuda"
     token: Optional[str] = None
 
@@ -229,8 +234,26 @@ class GeolipSDXL:
         self.unet = self.vae = self.clip_l = self.clip_g = self.qwen = None
         self._tok_l = self._tok_g = None
         self.frontend = SDXLQwenFrontEnd(cfg.conditioning, cfg.qwen_hidden) if build_frontend else None
-        for name in load:
-            self.load_component(name)
+        self._load_components(load)
+        # Eager-load the CLIP tokenizers here (only when a CLIP encoder is in play), so the
+        # 3-5s HTTP cost lands in setup rather than on the first tokenize() mid-training.
+        if self.clip_l is not None or self.clip_g is not None:
+            self._tokenizers()
+
+    def _load_components(self, load: Sequence[str]):
+        """Load the requested components. HF downloads dominate cold-start and release the
+        GIL during network I/O, so loading concurrently overlaps the big downloads. Set
+        GEOLIP_LOAD_WORKERS=1 to force the sequential path (e.g. if a backend mis-behaves
+        under concurrent CUDA placement)."""
+        names = list(load)
+        workers = int(os.environ.get("GEOLIP_LOAD_WORKERS", "4"))
+        if workers > 1 and len(names) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(workers, len(names))) as ex:
+                list(ex.map(self.load_component, names))   # .map re-raises any loader error
+        else:
+            for name in names:
+                self.load_component(name)
 
     def load_component(self, name: str):
         impl = getattr(self.comp, _IMPL_KEY[name])
@@ -309,3 +332,44 @@ def build_sdxl(conditioning_preset: str = PHASE1_RECIPE,
                           conditioning=conditioning_from_preset(conditioning_preset, **cond_overrides),
                           qwen_hidden=qwen_hidden)
     return GeolipSDXL(cfg, load=load)
+
+
+def prefetch_models(components: Sequence[str] = ALL_COMPONENTS,
+                    comp: Optional[ComponentConfig] = None, workers: int = 5) -> Dict[str, str]:
+    """Warm the HF cache for the requested components, downloading them IN PARALLEL.
+
+    On Colab/Jupyter the ephemeral disk is wiped each restart, so the first
+    build_sdxl()/build_cache() otherwise pays a long *serial* cold download. Call this
+    once at the top of a notebook to overlap the downloads; later loads then hit the
+    cache. Best-effort: a failed component is reported, not raised."""
+    comp = comp or ComponentConfig()
+    from concurrent.futures import ThreadPoolExecutor
+    from huggingface_hub import snapshot_download
+
+    v = comp.variant
+    unet_w = "diffusion_pytorch_model.fp16.safetensors" if v == "fp16" else "diffusion_pytorch_model.safetensors"
+    sdxl_patterns = {
+        "unet":   ["unet/config.json", f"unet/{unet_w}"],
+        "vae":    ["vae/config.json", "vae/diffusion_pytorch_model.safetensors"],   # loader pulls fp32
+        "clip_l": ["text_encoder/config.json", "text_encoder/model*.safetensors", "tokenizer/*"],
+        "clip_g": ["text_encoder_2/config.json", "text_encoder_2/model*.safetensors", "tokenizer_2/*"],
+    }
+    jobs = []   # (key, repo, kwargs)
+    for name in components:
+        if name in sdxl_patterns:
+            jobs.append((name, comp.sdxl_repo, {"allow_patterns": sdxl_patterns[name]}))
+        elif name == "qwen":
+            jobs.append((name, comp.qwen.repo, {}))   # the 0.8B repo is small; pull it whole
+
+    def _dl(job):
+        key, repo, kw = job
+        try:
+            return key, snapshot_download(repo, token=comp.token, **kw)
+        except Exception as e:                                  # best-effort warm-up
+            return key, f"FAILED: {type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(jobs)))) as ex:
+        results = dict(ex.map(_dl, jobs))
+    for k, path in results.items():
+        print(f"  prefetch {k}: {path}")
+    return results

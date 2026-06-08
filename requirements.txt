@@ -16,6 +16,7 @@ Pillow>=10.0
 # text-only pooled encoding.
 transformers>=5.2.0
 torchvision>=0.22
+accelerate>=0.26       # device_map='auto' fast-path so Qwen loads straight onto the GPU
 
 # --- data + hub ---
 datasets>=2.19        # streaming .iter(batch_size=...) + .take()

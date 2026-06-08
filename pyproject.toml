@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "geolip-sd-trainer"
 version = "0.1.0"
 description = "Pure-PyTorch SDXL trainer with Qwen-pooled + aleph conditioning on the Lune rectified-flow objective"
-readme = "README_github.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "AbstractPhil" }]
@@ -24,6 +24,7 @@ dependencies = [
     "Pillow>=10.0",
     "transformers>=5.2.0",   # Qwen3.5 needs transformers v5 (4.x will not load it)
     "torchvision>=0.22",
+    "accelerate>=0.26",      # device_map fast-path: Qwen loads straight onto the GPU
     "datasets>=2.19",
     "huggingface_hub>=0.26",
     "clean-fid>=0.1.35",

@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import queue
+import threading
 import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -39,6 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from . import dist
 from .model import (GeolipSDXL, SDXLModelConfig, ComponentConfig, conditioning_from_preset,
                     PHASE1_RECIPE, TRAIN_COMPONENTS, ENCODER_COMPONENTS)
 from .checkpoint import (save_checkpoint, load_checkpoint, find_latest_checkpoint,
@@ -92,18 +96,24 @@ class Phase1Config:
     batch_size: int = 4
     train_dtype: str = "bf16"               # bf16 on Blackwell
     seed: int = 42
-    num_workers: int = 2
+    num_workers: int = 4                    # 6 npy loads/sample -> more prefetch hides I/O
+
+    # throughput levers (perf-only; opt-in because they can't be runtime-verified here)
+    compile_unet: bool = False              # torch.compile(unet) — ~1.2-1.5x, long 1st-step warmup
+    use_channels_last: bool = False         # channels_last memory format for the conv-heavy UNet
 
     # safeguards — FID/KID (mission-critical, configurable)
     eval_cfgs: Tuple[float, ...] = (1.0, 3.0, 5.0)
     fid_every_epochs: int = 1
+    fid_start_epoch: int = 1                # skip FID before this epoch (early scores are noise)
     fid_images: int = 100                   # >=100 generated per cfg
     fid_ref_dir: Optional[str] = None       # real reference images (built by build_cache)
     fid_sample_steps: int = 28
+    fid_sample_batch_size: int = 16         # eval has no backward -> larger batch is safe
     # safeguards — prompt grid
     prompt_grid_per_epoch: int = 4          # at 25/50/75/100% of the epoch
     prompt_grid_n: int = 8                  # fixed prompts (first N cached rows)
-    prompt_grid_steps: int = 28
+    prompt_grid_steps: int = 20             # visual monitoring only -> fewer steps than FID
     sample_seed: int = 1234                 # fixed noise -> only the model varies
 
     # checkpoint / upload
@@ -114,6 +124,9 @@ class Phase1Config:
     upload_to_hub: bool = True
     upload_every_epochs: int = 5
     keep_last: int = 2
+    save_optimizer_state: bool = False      # full-finetune resume re-warms AdamW cheaply;
+                                            # set True to store it (doubles checkpoint size)
+    export_unet_every_ckpt: bool = False    # also write a clean standalone unet_e####.safetensors
     device: str = "cuda"
 
 
@@ -177,7 +190,11 @@ def euler_sample(model: GeolipSDXL, feat_batch, n_steps: int, shift: float,
     tids = model.build_time_ids(B, device, dtype)
     use_cfg = guidance is not None and guidance != 1.0
     if use_cfg:
-        ehs_u, txt_u = torch.zeros_like(ehs), torch.zeros_like(txt)
+        # batched CFG: stack cond+uncond on the batch dim and do ONE forward per step
+        # instead of two — same math, far better GPU utilization (unet_velocity is batched).
+        ehs_b = torch.cat([ehs, torch.zeros_like(ehs)], dim=0)
+        txt_b = torch.cat([txt, torch.zeros_like(txt)], dim=0)
+        tids_b = tids.repeat(2, 1)
 
     if seed is not None:
         g = torch.Generator().manual_seed(seed)
@@ -188,11 +205,13 @@ def euler_sample(model: GeolipSDXL, feat_batch, n_steps: int, shift: float,
     sig = (shift * sig) / (1 + (shift - 1) * sig)
     for i in range(n_steps):
         s, s_next = sig[i], sig[i + 1]
-        t = (s * 1000.0).repeat(B)
-        v = model.unet_velocity(z, t, ehs, txt, tids)
         if use_cfg:
-            v_u = model.unet_velocity(z, t, ehs_u, txt_u, tids)
-            v = v_u + guidance * (v - v_u)
+            t = (s * 1000.0).repeat(2 * B)
+            v_both = model.unet_velocity(z.repeat(2, 1, 1, 1), t, ehs_b, txt_b, tids_b)
+            v_c, v_u = v_both[:B], v_both[B:]
+            v = v_u + guidance * (v_c - v_u)
+        else:
+            v = model.unet_velocity(z, (s * 1000.0).repeat(B), ehs, txt, tids)
         z = z + (s_next - s) * v
     img = model.vae_decode_latent(z)
     img = ((img.float() / 2 + 0.5).clamp(0, 1) * 255).round().byte().cpu().numpy()
@@ -204,10 +223,22 @@ def euler_sample(model: GeolipSDXL, feat_batch, n_steps: int, shift: float,
 # cached dataset (reads the fp16 npy cache from build_cache)
 # ============================================================================
 
-def _cache_paths(cache_dir, rid):
-    d = Path(cache_dir)
-    return (d / f"{rid}_lat.npy", d / f"{rid}_clipl.npy", d / f"{rid}_qpool.npy",
-            d / f"{rid}_clipg.npy", d / f"{rid}_clipgp.npy", d / f"{rid}_addr.npy")
+# One .npz per row (was 6 tiny .npy files) -> ~6x fewer files, which is the difference
+# between minutes and hours on networked/cloud storage. Named keys also remove the
+# latent file-order footgun the parallel _cache_paths/return-order had.
+_CACHE_KEYS = ("lat", "clipl", "qpool", "clipg", "clipgp", "addr")
+
+
+def _cache_path(cache_dir, rid) -> Path:
+    return Path(cache_dir) / f"{rid}.npz"
+
+
+def _save_row(path, arrays: Dict[str, np.ndarray]):
+    """Write one row's six features into a single .npz (fp16), atomically."""
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "wb") as fh:                 # file handle -> np.savez won't append .npz
+        np.savez(fh, **arrays)
+    os.replace(tmp, path)
 
 
 class CachedDS(torch.utils.data.Dataset):
@@ -220,41 +251,93 @@ class CachedDS(torch.utils.data.Dataset):
         return len(self.ids)
 
     def __getitem__(self, i):
-        pl, pc, pq, pg, pgp, pa = _cache_paths(self.cache_dir, self.ids[i])
-        load = lambda p: torch.from_numpy(np.load(p)).float()
-        return load(pl), load(pc), load(pq), load(pa), load(pg), load(pgp)
+        # Keep the cache's fp16 dtype here; the .to(device, bf16) at the train step casts
+        # on-GPU, so we avoid the old fp16->fp32 CPU upcast (wasted 2x host bandwidth).
+        with np.load(_cache_path(self.cache_dir, self.ids[i])) as z:
+            t = {k: torch.from_numpy(np.ascontiguousarray(z[k], dtype=np.float16)) for k in _CACHE_KEYS}
+        return t["lat"], t["clipl"], t["qpool"], t["addr"], t["clipg"], t["clipgp"]
 
 
 def manifest_path(cache_dir, n_images):
     return Path(cache_dir) / f"ids_{n_images or 'all'}.json"
 
 
+def _rank_manifest_path(cache_dir, n_images, r):
+    return Path(cache_dir) / f"ids_{n_images or 'all'}_rank{r}.json"
+
+
+def _atomic_write_text(path, text: str):
+    tmp = str(path) + ".tmp"
+    Path(tmp).write_text(text)
+    os.replace(tmp, path)
+
+
 # ============================================================================
 # precompute — stream the dataset columnar, cache features via the OWNED encoders
 # ============================================================================
 
+def _threaded_prefetch(produce, depth: int = 2):
+    """Run generator `produce` on a background thread, yielding items IN ORDER up to
+    `depth` ahead — overlaps CPU stream/decode with the consumer's GPU encode. Producer
+    errors are re-raised on the consumer side. The producer must stay CUDA-free."""
+    q: "queue.Queue" = queue.Queue(maxsize=depth)
+    SENT = object()
+
+    def run():
+        try:
+            for item in produce():
+                q.put((item, None))
+        except Exception as e:                          # surface to the consumer
+            q.put((None, e))
+        finally:
+            q.put((SENT, None))
+
+    threading.Thread(target=run, daemon=True).start()
+    while True:
+        item, err = q.get()
+        if item is SENT:
+            break
+        if err is not None:
+            raise err
+        yield item
+
+
 @torch.no_grad()
 def build_cache(cfg: Phase1Config) -> List[str]:
-    """Stream rows columnar (datasets streaming + .iter), cache per row:
-    latent / CLIP-L seq / CLIP-G seq+pooled / Qwen pooled / aleph address — using
-    GeolipSDXL's OWNED native encoders. Idempotent: returns ids without streaming if
-    the manifest + all files exist. Also caches the FID reference images once."""
+    """Stream rows columnar (datasets streaming + .iter), cache per row into ONE .npz:
+    latent / CLIP-L seq / CLIP-G seq+pooled / Qwen pooled / aleph address — via
+    GeolipSDXL's OWNED native encoders. Idempotent: returns ids without streaming if the
+    (merged) manifest + all files exist. Also caches the FID reference images once.
+
+    Throughput: PIL decode + ownership/existence filtering run on a background thread, so
+    the CPU prep overlaps the GPU encode (the encode is the bottleneck). Set
+    components.qwen.generate=False / vae_dtype="bf16" to cut the two biggest per-row costs.
+
+    Multi-pod (WORLD_SIZE>1): each rank ENCODES only its shard (global_idx % world_size ==
+    rank), so the dominant Qwen/VAE cost splits ~world_size ways. Every rank still iterates
+    the full stream (keeps the global row index — and the fallback row id — unique + stable
+    across re-runs), writes a per-rank manifest, then rank 0 merges all shards into the
+    canonical manifest once each rank's `.done` marker appears. All ranks return the FULL
+    id list; the training DistributedSampler does the train-time split. (A dataset with an
+    `id` column lets a future `.shard()` also skip the redundant stream download.)"""
     import datasets as hfds
     import torchvision.transforms as T
 
     Path(cfg.cache_dir).mkdir(parents=True, exist_ok=True)
+    rank, ws = dist.rank(), dist.world_size()
+    tag = f"ids_{cfg.n_images or 'all'}"
     man = manifest_path(cfg.cache_dir, cfg.n_images)
-    if man.exists():
+    if man.exists():                                    # canonical (merged) manifest present
         ids = json.loads(man.read_text())
-        if ids and all(all(p.exists() for p in _cache_paths(cfg.cache_dir, r)) for r in ids):
+        if ids and all(_cache_path(cfg.cache_dir, r).exists() for r in ids):
             print(f"✓ cache complete ({len(ids)} rows) — skipping precompute")
             return ids
 
-    dtype = _DTYPES[cfg.train_dtype]
     mcfg = SDXLModelConfig(components=cfg.components,
                            conditioning=conditioning_from_preset(cfg.conditioning_preset, n_addr=cfg.n_addr),
                            image_size=cfg.image_size, vae_scale=cfg.vae_scale)
     enc = GeolipSDXL(mcfg, load=ENCODER_COMPONENTS, build_frontend=False)   # vae+clip_l+clip_g+qwen
+    vae_dt = _DTYPES[cfg.components.vae_dtype]
     to_tensor = T.Compose([T.Resize(cfg.image_size), T.CenterCrop(cfg.image_size), T.ToTensor()])
 
     ref_dir = Path(cfg.fid_ref_dir or (Path(cfg.cache_dir) / "fid_ref"))
@@ -263,42 +346,82 @@ def build_cache(cfg: Phase1Config) -> List[str]:
     stream = hfds.load_dataset(cfg.dataset_repo, split="train", streaming=True)
     if cfg.n_images:
         stream = stream.take(cfg.n_images)
-    print(f"Streaming + precomputing {cfg.n_images or 'all'} rows via owned encoders ...")
+    shard_note = f" [rank {rank}/{ws}]" if ws > 1 else ""
+    print(f"Streaming + precomputing {cfg.n_images or 'all'} rows via owned encoders ...{shard_note}")
+
+    ref_cap = max(cfg.fid_images, 200)
+
+    def producer():                                     # runs on a background thread (CUDA-free)
+        gpos = 0
+        ref_count = len(list(ref_dir.glob("*.png"))) if dist.is_main() else 0   # one glob, then count
+        for batch in stream.iter(batch_size=16):
+            caps, pil, addrs = batch["caption"], batch["image"], batch["aleph_address"]
+            has_id = "id" in batch
+            n = len(caps)
+            base = gpos
+            rids = [str(batch["id"][j]) if has_id else f"row{base + j:08d}" for j in range(n)]
+            gpos += n
+            owned = list(range(n)) if ws == 1 else [j for j in range(n) if (base + j) % ws == rank]
+            rids_owned = [rids[j] for j in owned]
+            if dist.is_main() and ref_count < ref_cap:                          # real reference set
+                for j in range(n):
+                    if ref_count >= ref_cap:
+                        break
+                    pil[j].convert("RGB").resize((cfg.image_size, cfg.image_size)).save(
+                        ref_dir / f"{rids[j]}.png")
+                    ref_count += 1
+            todo = [j for j in owned if not _cache_path(cfg.cache_dir, rids[j]).exists()]
+            if not todo:
+                yield rids_owned, [], None, None, None
+                continue
+            imgs = torch.stack([to_tensor(pil[j].convert("RGB")) for j in todo])   # CPU decode
+            yield rids_owned, [rids[j] for j in todo], [caps[j] for j in todo], imgs, [addrs[j] for j in todo]
 
     from tqdm.auto import tqdm
-    ids, gpos = [], 0
-    for batch in tqdm(stream.iter(batch_size=16), desc="precompute"):
-        caps, pil, addrs = batch["caption"], batch["image"], batch["aleph_address"]
-        has_id = "id" in batch
-        n = len(caps)
-        rids = [str(batch["id"][j]) if has_id else f"row{gpos + j:08d}" for j in range(n)]
-        gpos += n
-        ids.extend(rids)
-        todo = [j for j in range(n) if not all(p.exists() for p in _cache_paths(cfg.cache_dir, rids[j]))]
-        if not todo:
+    ids: List[str] = []
+    for rids_owned, todo_rids, caps_todo, imgs, addrs_todo in tqdm(_threaded_prefetch(producer),
+                                                                   desc=f"precompute{shard_note}"):
+        ids.extend(rids_owned)
+        if not todo_rids:
             continue
-        caps_t = [caps[j] for j in todo]
-        imgs = torch.stack([to_tensor(pil[j].convert("RGB")) for j in todo])
-        imgs = (imgs * 2 - 1).to(enc.comp.device, _DTYPES[cfg.components.vae_dtype])
+        imgs = (imgs * 2 - 1).to(enc.comp.device, vae_dt)
+        lat = enc.vae_encode_latent(imgs)                                   # [b,4,128,128]
+        clip_l_seq = enc.encode_clip_l(caps_todo)
+        clip_g_seq, clip_g_pool = enc.encode_clip_g(caps_todo)
+        qpool = enc.encode_qwen(caps_todo)                                  # cpu fp32 (config-gated)
+        for k, rid in enumerate(todo_rids):
+            _save_row(_cache_path(cfg.cache_dir, rid), {
+                "lat":    lat[k].float().cpu().numpy().astype(np.float16),
+                "clipl":  clip_l_seq[k].float().cpu().numpy().astype(np.float16),
+                "qpool":  qpool[k].numpy().astype(np.float16),
+                "clipg":  clip_g_seq[k].float().cpu().numpy().astype(np.float16),
+                "clipgp": clip_g_pool[k].float().cpu().numpy().astype(np.float16),
+                "addr":   np.asarray(addrs_todo[k], dtype=np.float16),
+            })
 
-        lat = enc.vae_encode_latent(imgs.to(_DTYPES[cfg.components.vae_dtype]))   # [b,4,128,128]
-        clip_l_seq = enc.encode_clip_l(caps_t)
-        clip_g_seq, clip_g_pool = enc.encode_clip_g(caps_t)
-        qpool = enc.encode_qwen(caps_t)
-        for jj, j in enumerate(todo):
-            pl, pc, pq, pg, pgp, pa = _cache_paths(cfg.cache_dir, rids[j])
-            np.save(pl, lat[jj].float().cpu().numpy().astype(np.float16))
-            np.save(pc, clip_l_seq[jj].float().cpu().numpy().astype(np.float16))
-            np.save(pq, qpool[jj].numpy().astype(np.float16))
-            np.save(pg, clip_g_seq[jj].float().cpu().numpy().astype(np.float16))
-            np.save(pgp, clip_g_pool[jj].float().cpu().numpy().astype(np.float16))
-            np.save(pa, np.asarray(addrs[j], dtype=np.float16))
-            if len(list(ref_dir.glob("*.png"))) < max(cfg.fid_images, 200):    # real reference set
-                pil[j].convert("RGB").resize((cfg.image_size, cfg.image_size)).save(
-                    ref_dir / f"{rids[j]}.png")
+    # --- manifest finalize -------------------------------------------------
+    if ws == 1:
+        _atomic_write_text(man, json.dumps(ids))
+        print(f"✓ precompute done ({len(ids)} rows); fid reference -> {ref_dir}")
+        return ids
 
-    man.write_text(json.dumps(ids))
-    print(f"✓ precompute done ({len(ids)} rows); fid reference -> {ref_dir}")
+    _atomic_write_text(_rank_manifest_path(cfg.cache_dir, cfg.n_images, rank), json.dumps(ids))
+    (Path(cfg.cache_dir) / f"{tag}.rank{rank}.done").write_text("ok")
+    merged_marker = Path(cfg.cache_dir) / f"{tag}.merged"
+    if dist.is_main():
+        for r in range(ws):                                                 # wait for every shard
+            dist.wait_for_marker(Path(cfg.cache_dir) / f"{tag}.rank{r}.done")
+        merged: List[str] = []
+        for r in range(ws):
+            merged.extend(json.loads(_rank_manifest_path(cfg.cache_dir, cfg.n_images, r).read_text()))
+        _atomic_write_text(man, json.dumps(merged))
+        merged_marker.write_text("ok")
+        print(f"✓ precompute done — merged {len(merged)} rows from {ws} ranks; fid ref -> {ref_dir}")
+        ids = merged
+    else:
+        dist.wait_for_marker(merged_marker)
+        ids = json.loads(man.read_text())
+    dist.barrier()                                                          # extra sync if a group exists
     return ids
 
 
@@ -317,12 +440,32 @@ def fid_kid_eval(model: GeolipSDXL, eval_rows: List, cfg: Phase1Config, epoch: i
         print("  (FID/KID skipped: `pip install clean-fid`)")
         return {}
     ref_dir = str(cfg.fid_ref_dir or (Path(cfg.cache_dir) / "fid_ref"))
+    # Precompute the reference-set Inception stats ONCE (clean-fid caches them on disk),
+    # instead of re-extracting them on every compute_fid/compute_kid call (3 cfgs x every
+    # epoch). Fall back to the direct ref-dir comparison if the custom-stats API differs.
+    stats_name = f"geolip_fidref_{Path(ref_dir).name}_{cfg.image_size}"
+    use_custom = False
+    try:
+        if not cleanfid.test_stats_exists(stats_name, mode="clean"):
+            cleanfid.make_custom_stats(stats_name, ref_dir, mode="clean")
+        use_custom = True
+    except Exception as e:
+        print(f"  (FID custom-stats cache unavailable: {type(e).__name__}: {e}; using ref dir)")
+
+    def _score(fn, gen):
+        if use_custom:
+            try:
+                return fn(gen, dataset_name=stats_name, dataset_split="custom", mode="clean", verbose=False)
+            except Exception:
+                pass
+        return fn(gen, ref_dir, mode="clean", verbose=False)
+
     results = {}
     for g in cfg.eval_cfgs:
         gen_dir = out_root / "fid" / f"epoch_{epoch:04d}" / f"cfg_{g}"
         gen_dir.mkdir(parents=True, exist_ok=True)
         made = 0
-        bs = 4
+        bs = cfg.fid_sample_batch_size
         idx = 0
         while made < cfg.fid_images and idx < len(eval_rows):
             batch = eval_rows[idx:idx + bs]; idx += bs
@@ -332,8 +475,8 @@ def fid_kid_eval(model: GeolipSDXL, eval_rows: List, cfg: Phase1Config, epoch: i
             for p in pics:
                 p.save(gen_dir / f"{made:05d}.png"); made += 1
         try:
-            f = cleanfid.compute_fid(str(gen_dir), ref_dir, mode="clean", verbose=False)
-            k = cleanfid.compute_kid(str(gen_dir), ref_dir, mode="clean", verbose=False)
+            f = _score(cleanfid.compute_fid, str(gen_dir))
+            k = _score(cleanfid.compute_kid, str(gen_dir))
             results[g] = {"fid": float(f), "kid": float(k), "n": made}
             print(f"  FID/KID @cfg {g}: FID {f:.1f}  KID {k:.4f}  (n={made})")
         except Exception as e:
@@ -361,37 +504,58 @@ def prompt_grid_eval(model: GeolipSDXL, sample_feat, cfg: Phase1Config,
 class Phase1Trainer:
     def __init__(self, cfg: Phase1Config):
         self.cfg = cfg
-        self.device = cfg.device
         self.dtype = _DTYPES[cfg.train_dtype]
+        # multi-pod: bring up the process group (no-op single-pod) and pin this rank's GPU.
+        self.local_rank = dist.init_distributed(cfg.device)
+        self.rank, self.world_size = dist.rank(), dist.world_size()
+        self.device = cfg.device
+        if self.world_size > 1 and cfg.device.startswith("cuda") and torch.cuda.is_available():
+            self.device = f"cuda:{self.local_rank}"
+            cfg.components.device = self.device          # components load onto this rank's GPU
+        # Same seed on every rank => identical frozen UNet load + identical front-end init
+        # (the front-end uses the global RNG), so ranks start in sync without a broadcast.
         torch.manual_seed(cfg.seed)
         torch.backends.cuda.matmul.allow_tf32 = True
         self.run_dir = Path(cfg.out_dir) / cfg.run_name
-        (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "samples").mkdir(parents=True, exist_ok=True)
+        if dist.is_main():
+            (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+            (self.run_dir / "samples").mkdir(parents=True, exist_ok=True)
         self.token = resolve_hf_token()
-        if cfg.upload_to_hub and self.token:
+        if dist.is_main() and cfg.upload_to_hub and self.token:
             print(f"  HF user: {hf_whoami(self.token)}")
+        # only rank 0 writes the shared run dir / HF repo (concurrent ranks would clobber it)
         self.uploader = HubUploader(cfg.hf_repo_id, cfg.hf_phase, cfg.run_name, self.token,
-                                    enabled=cfg.upload_to_hub)
+                                    enabled=cfg.upload_to_hub and dist.is_main())
+        self._upload_threads: List[threading.Thread] = []
 
     # -- setup: cache -> model -> trainable set -> optimizer/schedules --
     def setup(self):
         cfg = self.cfg
         self.ids = build_cache(cfg)
+        dist.barrier()                                               # all ranks see the merged cache
         self.ds = CachedDS(cfg.cache_dir, self.ids)
+        # multi-pod: a DistributedSampler partitions the rows across ranks (each step is a
+        # distinct shard) and we average gradients manually after backward (see _sync_grads).
+        self.sampler = (torch.utils.data.distributed.DistributedSampler(
+            self.ds, num_replicas=self.world_size, rank=self.rank, shuffle=True, drop_last=True)
+            if self.world_size > 1 else None)
         self.loader = torch.utils.data.DataLoader(
-            self.ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
-            drop_last=True, pin_memory=True, persistent_workers=cfg.num_workers > 0)
+            self.ds, batch_size=cfg.batch_size, shuffle=(self.sampler is None), sampler=self.sampler,
+            num_workers=cfg.num_workers, drop_last=True, pin_memory=True,
+            persistent_workers=cfg.num_workers > 0)
         self.steps_per_epoch = len(self.loader)
         self.total_steps = self.steps_per_epoch * cfg.num_epochs
 
-        qwen_hidden = int(np.load(_cache_paths(cfg.cache_dir, self.ids[0])[2]).shape[-1])
+        with np.load(_cache_path(cfg.cache_dir, self.ids[0])) as z:
+            qwen_hidden = int(z["qpool"].shape[-1])
         mcfg = SDXLModelConfig(
             components=cfg.components,
             conditioning=conditioning_from_preset(cfg.conditioning_preset, n_addr=cfg.n_addr),
             qwen_hidden=qwen_hidden, image_size=cfg.image_size, vae_scale=cfg.vae_scale)
         self.model = GeolipSDXL(mcfg, load=TRAIN_COMPONENTS)          # unet + vae
         self.model.frontend.to(self.device, self.dtype)
+        if cfg.use_channels_last:                                    # conv-heavy backbone speedup
+            self.model.unet = self.model.unet.to(memory_format=torch.channels_last)
 
         # trainable set by mode (mode-agnostic checkpointing keys off requires_grad)
         self.model.unet.requires_grad_(False)
@@ -407,6 +571,7 @@ class Phase1Trainer:
         for p in unet_params:
             p.requires_grad_(False)                                  # Stage A: UNet frozen
         self.model.frontend.requires_grad_(True)
+        self._trainable_params = self._trainable()                   # cached (Stage-A set); refreshed at Stage B
 
         groups = [{"params": list(self.model.frontend.parameters()), "lr": cfg.frontend_lr, "name": "frontend"}]
         if unet_params:
@@ -418,31 +583,67 @@ class Phase1Trainer:
         self.start_epoch = 0
         self.loss_log: List[dict] = []
         self._stage_b = False
+        # time_ids are constant per run -> build once, expand (zero-copy) per step
+        s = cfg.image_size
+        self.time_ids_base = torch.tensor([s, s, 0, 0, s, s], device=self.device,
+                                          dtype=self.dtype).unsqueeze(0)
 
-        # fixed sample prompts (first N rows) — stable across epochs
-        sb = [self.ds[i] for i in range(min(cfg.prompt_grid_n, len(self.ds)))]
-        self.sample_feat = tuple(torch.stack([b[k] for b in sb]) for k in range(6))
-        self.eval_rows = [self.ds[i] for i in range(min(len(self.ds), cfg.fid_images + 64))]
+        # fixed eval inputs — only rank 0 evaluates, so others skip the materialization
+        if dist.is_main():
+            sb = [self.ds[i] for i in range(min(cfg.prompt_grid_n, len(self.ds)))]
+            self.sample_feat = tuple(torch.stack([b[k] for b in sb]) for k in range(6))
+            self.eval_rows = [self.ds[i] for i in range(min(len(self.ds), cfg.fid_images + 64))]
+        else:
+            self.sample_feat, self.eval_rows = None, []
 
         self._maybe_resume()
-        print(f"  setup: {len(self.ds)} rows · {self.steps_per_epoch} steps/epoch × {cfg.num_epochs} "
-              f"= {self.total_steps} · unet_mode={cfg.unet_mode} "
-              f"(trainable unet params {sum(p.numel() for p in unet_params)/1e6:.0f}M) shift={cfg.shift}")
+        if cfg.compile_unet:                                         # after resume (compile wraps fwd)
+            try:
+                self.model.unet = torch.compile(self.model.unet, mode="reduce-overhead")
+            except Exception as e:
+                print(f"  (torch.compile skipped: {type(e).__name__}: {e})")
+        if dist.is_main():
+            print(f"  setup: {len(self.ds)} rows · {self.steps_per_epoch} steps/epoch × {cfg.num_epochs} "
+                  f"= {self.total_steps} · unet_mode={cfg.unet_mode} world_size={self.world_size} "
+                  f"(trainable unet params {sum(p.numel() for p in unet_params)/1e6:.0f}M) shift={cfg.shift}")
+
+    def _raw_unet(self):
+        """The underlying UNet module, unwrapping torch.compile's OptimizedModule so
+        checkpoint/export key off the real parameter names (not the `_orig_mod.` prefix)."""
+        return getattr(self.model.unet, "_orig_mod", self.model.unet)
 
     def _modules(self):
-        return {"unet": self.model.unet, "frontend": self.model.frontend}
+        return {"unet": self._raw_unet(), "frontend": self.model.frontend}
+
+    def _sync_grads(self):
+        """Average gradients of the currently-trainable params across ranks (manual DDP).
+        Robust to the staged Stage-A→B unfreeze that auto-DDP can't track; coalesces into
+        one all-reduce/step. No-op single-pod."""
+        if self.world_size <= 1:
+            return
+        grads = [p.grad for p in self._trainable_params if p.grad is not None]
+        if not grads:
+            return
+        flat = torch._utils._flatten_dense_tensors(grads)
+        torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+        flat /= self.world_size
+        for g, synced in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads)):
+            g.copy_(synced)
 
     def _maybe_resume(self):
         latest = find_latest_checkpoint(self.run_dir / "checkpoints")
         if latest is None:
             return
+        # every rank reads the same (shared-storage) checkpoint -> stays in sync
         meta = load_checkpoint(latest, self._modules(), optimizer=self.opt, map_location="cpu")
         self.gstep = meta.get("gstep", 0)
         self.start_epoch = meta.get("epoch", 0)
         self.loss_log = meta.get("loss_log", [])
         if self.gstep >= self.cfg.stage_a_steps:
             self._enter_stage_b()
-        print(f"↻ resumed from {latest.name} @ epoch {self.start_epoch} (gstep {self.gstep})")
+        if dist.is_main():
+            print(f"↻ resumed from {latest.name} @ epoch {self.start_epoch} (gstep {self.gstep})")
+        dist.barrier()
 
     def _enter_stage_b(self):
         if self._stage_b:
@@ -452,7 +653,9 @@ class Phase1Trainer:
             return
         for p in self.unet_params:
             p.requires_grad_(True)
-        print(f"  → Stage B: UNet unfrozen ({self.cfg.unet_mode}) at gstep {self.gstep}")
+        self._trainable_params = self._trainable()                   # refresh cached set (now incl. UNet)
+        if dist.is_main():
+            print(f"  → Stage B: UNet unfrozen ({self.cfg.unet_mode}) at gstep {self.gstep}")
 
     def _set_lrs(self):
         fe_f, unet_f = lr_factors(self.gstep, self.cfg)
@@ -470,10 +673,13 @@ class Phase1Trainer:
         cfg = self.cfg
         self.model.unet.train(); self.model.frontend.train()
         grid_marks = {int(self.steps_per_epoch * f) for f in (0.25, 0.5, 0.75)}
+        from tqdm.auto import tqdm
+        cl = cfg.use_channels_last
         for epoch in range(self.start_epoch + 1, cfg.num_epochs + 1):
+            if self.sampler is not None:
+                self.sampler.set_epoch(epoch)                       # distinct shuffle per epoch/rank
             ep_loss = []
-            from tqdm.auto import tqdm
-            pbar = tqdm(self.loader, desc=f"epoch {epoch}/{cfg.num_epochs}")
+            pbar = tqdm(self.loader, desc=f"epoch {epoch}/{cfg.num_epochs}", disable=not dist.is_main())
             for step_in_epoch, batch in enumerate(pbar):
                 if not self._stage_b and self.gstep >= cfg.stage_a_steps:
                     self._enter_stage_b()
@@ -482,40 +688,47 @@ class Phase1Trainer:
                 B = lat.shape[0]
 
                 ehs, txt = self.model.build_conditioning(qpool, clipl, clipg, clipgp, addr)
-                tids = self.model.build_time_ids(B, self.device, self.dtype)
+                tids = self.time_ids_base.expand(B, -1)             # zero-copy (constant per run)
 
                 p_drop = self.dropout.value(self.gstep)
                 drop = torch.rand(B, device=self.device) < p_drop
-                if drop.any():
-                    ehs = ehs.clone(); txt = txt.clone()
-                    ehs[drop] = 0; txt[drop] = 0
+                if drop.any():                                      # build_conditioning returns fresh,
+                    ehs[drop] = 0; txt[drop] = 0                    # not-yet-consumed tensors -> zero in place
 
                 x_t, t, v = fm_targets(lat, cfg.shift)
+                if cl:
+                    x_t = x_t.to(memory_format=torch.channels_last)
                 pred = self.model.unet_velocity(x_t, t, ehs, txt, tids)
                 loss = F.mse_loss(pred.float(), v.float())
 
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
-                gnorm = torch.nn.utils.clip_grad_norm_(self._trainable(), cfg.grad_clip)
+                self._sync_grads()                                  # average grads across ranks (manual DDP)
+                gnorm = torch.nn.utils.clip_grad_norm_(self._trainable_params, cfg.grad_clip)
                 self.opt.step()
                 self.gstep += 1
-                ep_loss.append(loss.item())
-                pbar.set_postfix({"loss": f"{loss.item():.4f}", "drop": f"{p_drop:.2f}",
-                                  "gnorm": f"{float(gnorm):.2f}", "stage": "B" if self._stage_b else "A"})
 
-                if step_in_epoch in grid_marks and cfg.prompt_grid_per_epoch > 1:
-                    self._prompt_grid(epoch, f"e{epoch:04d}_{int(100*step_in_epoch/self.steps_per_epoch):03d}pct")
+                loss_val = loss.item()                              # single GPU->CPU sync, reused below
+                ep_loss.append(loss_val)
+                if dist.is_main():
+                    pbar.set_postfix({"loss": f"{loss_val:.4f}", "drop": f"{p_drop:.2f}",
+                                      "gnorm": f"{float(gnorm):.2f}", "stage": "B" if self._stage_b else "A"})
+                    if step_in_epoch in grid_marks and cfg.prompt_grid_per_epoch > 1:
+                        self._prompt_grid(epoch, f"e{epoch:04d}_{int(100*step_in_epoch/self.steps_per_epoch):03d}pct")
 
             mean_loss = float(np.mean(ep_loss)) if ep_loss else float("nan")
-            self.loss_log.append({"epoch": epoch, "loss": mean_loss, "gstep": self.gstep})
-            (self.run_dir / "loss_log.json").write_text(json.dumps(self.loss_log, indent=2))
-            print(f"  epoch {epoch} mean loss {mean_loss:.4f}")
-
-            self._prompt_grid(epoch, f"e{epoch:04d}_100pct")            # 4th grid (end of epoch)
-            if epoch % cfg.fid_every_epochs == 0:
-                self._fid(epoch)
-            if epoch % cfg.upload_every_epochs == 0 or epoch == cfg.num_epochs:
-                self._checkpoint(epoch)
+            if self.world_size > 1:                                 # global epoch mean for the log
+                mean_loss = float(dist.all_reduce_mean(torch.tensor(mean_loss, device=self.device)))
+            if dist.is_main():
+                self.loss_log.append({"epoch": epoch, "loss": mean_loss, "gstep": self.gstep})
+                (self.run_dir / "loss_log.json").write_text(json.dumps(self.loss_log, indent=2))
+                print(f"  epoch {epoch} mean loss {mean_loss:.4f}")
+                self._prompt_grid(epoch, f"e{epoch:04d}_100pct")    # 4th grid (end of epoch)
+                if epoch >= cfg.fid_start_epoch and epoch % cfg.fid_every_epochs == 0:
+                    self._fid(epoch)
+                if epoch % cfg.upload_every_epochs == 0 or epoch == cfg.num_epochs:
+                    self._checkpoint(epoch)
+            dist.barrier()                                          # non-main ranks wait out rank-0 eval/ckpt
 
         self._finalize()
 
@@ -542,29 +755,69 @@ class Phase1Trainer:
             self.model.unet.train(); self.model.frontend.train()
 
     def _checkpoint(self, epoch):
-        ckpt = self.run_dir / "checkpoints" / f"ckpt_e{epoch:04d}.pt"
+        # mode-agnostic resume checkpoint as safetensors (no pickle, mmap-able); optimizer
+        # state is opt-in (save_optimizer_state) so full-finetune ckpts stay ~1x params.
+        ckpt = self.run_dir / "checkpoints" / f"ckpt_e{epoch:04d}.safetensors"
         save_checkpoint(ckpt, self._modules(), optimizer=self.opt,
                         meta={"epoch": epoch, "gstep": self.gstep, "loss_log": self.loss_log,
-                              "config": asdict(self.cfg)})
+                              "config": asdict(self.cfg)},
+                        save_optimizer=self.cfg.save_optimizer_state)
+        extra = []
+        if self.cfg.export_unet_every_ckpt:                          # standalone inference file
+            unet_st = self.run_dir / "checkpoints" / f"unet_e{epoch:04d}.safetensors"
+            export_unet_safetensors(unet_st, self._raw_unet())
+            extra.append(unet_st.name)
         rotate_checkpoints(self.run_dir / "checkpoints", self.cfg.keep_last)
         print(f"  ✓ checkpoint {ckpt.name}")
-        self.uploader.upload_checkpoint(ckpt, samples_root=str(self.run_dir / "samples"))
+        self._spawn_upload(ckpt, extra)                              # don't block training on the upload
+
+    def _spawn_upload(self, ckpt: Path, extra_names: List[str]):
+        if not self.uploader.enabled:
+            return
+        sroot = str(self.run_dir / "samples")
+        ckpt_dir = str(ckpt.parent)
+        # sidecars the resume needs (.meta.json always; .opt.pt only if saved)
+        sidecars = [ckpt.with_suffix(".meta.json").name] + list(extra_names)
+        sidecars += [Path(str(ckpt) + ".opt.pt").name] if Path(str(ckpt) + ".opt.pt").exists() else []
+
+        def _do():
+            self.uploader.upload_checkpoint(ckpt, samples_root=sroot)
+            if sidecars:
+                self.uploader.upload_folder(ckpt_dir, "checkpoints", allow_patterns=sidecars)
+
+        t = threading.Thread(target=_do, daemon=True); t.start()
+        self._upload_threads.append(t)
+
+    def _join_uploads(self):
+        for t in self._upload_threads:
+            t.join()
+        self._upload_threads = []
 
     def _finalize(self):
-        out = self.run_dir / "checkpoints" / "unet_final.safetensors"
-        export_unet_safetensors(out, self.model.unet)
-        self.uploader.upload_folder(str(self.run_dir / "checkpoints"), "checkpoints",
-                                    allow_patterns=["unet_final.safetensors"])
-        print(f"\n✅ phase-1 run '{self.cfg.run_name}' complete.")
+        self._join_uploads()                                         # let backgrounded uploads finish
+        if dist.is_main():
+            out = self.run_dir / "checkpoints" / "unet_final.safetensors"
+            export_unet_safetensors(out, self._raw_unet())
+            self.uploader.upload_folder(str(self.run_dir / "checkpoints"), "checkpoints",
+                                        allow_patterns=["unet_final.safetensors"])
+            print(f"\n✅ phase-1 run '{self.cfg.run_name}' complete.")
+        dist.barrier()
 
 
 def train(cfg: Optional[Phase1Config] = None):
     cfg = cfg or Phase1Config()
     tr = Phase1Trainer(cfg)
-    tr.setup()
-    tr.fit()
+    try:
+        tr.setup()
+        tr.fit()
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
     return tr
 
 
 if __name__ == "__main__":
+    # single-pod:  python -m geolip_sd_trainer.trainer
+    # multi-pod:   torchrun --nproc_per_node=<gpus> --nnodes=<N> --node_rank=<r> \
+    #                       --master_addr=<host> --master_port=<port> -m geolip_sd_trainer.trainer
     train()

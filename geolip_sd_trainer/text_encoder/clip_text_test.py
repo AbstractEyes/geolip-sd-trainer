@@ -45,9 +45,12 @@ def load_clip_text(cfg: CLIPTextConfig, repo_or_path: str = SDXL_REPO,
                    subfolder: str = "text_encoder", variant: str = "fp16",
                    device: str = "cuda", dtype: torch.dtype = torch.bfloat16,
                    token: Optional[str] = None) -> NativeCLIPTextEncoder:
-    model = NativeCLIPTextEncoder(cfg)
     sd = _load_state_dict(repo_or_path, subfolder, variant, token)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # meta-device build avoids random-initializing CLIP on CPU just to overwrite it
+    # (see load_native_sdxl_unet); assign=True swaps the checkpoint tensors straight in.
+    with torch.device("meta"):
+        model = NativeCLIPTextEncoder(cfg)
+    missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
     if missing or unexpected:
         raise RuntimeError(
             f"CLIP load mismatch ({subfolder}) — missing={len(missing)} unexpected={len(unexpected)}.\n"

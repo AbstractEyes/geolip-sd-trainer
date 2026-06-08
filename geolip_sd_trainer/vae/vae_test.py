@@ -55,9 +55,12 @@ def load_native_sdxl_vae(repo_or_path: str = SDXL_REPO, variant: str = "fp32",
                          read_config_from_hub: bool = False) -> NativeSDXLVAE:
     if cfg is None:
         cfg = config_from_hf(repo_or_path, token) if read_config_from_hub else SDXLVAEConfig()
-    model = NativeSDXLVAE(cfg)
     sd = _load_state_dict(repo_or_path, variant, token)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # meta-device build avoids random-initializing the VAE on CPU just to overwrite it
+    # (see load_native_sdxl_unet); assign=True swaps the checkpoint tensors straight in.
+    with torch.device("meta"):
+        model = NativeSDXLVAE(cfg)
+    missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
     if missing or unexpected:
         raise RuntimeError(
             f"SDXL VAE load mismatch — missing={len(missing)} unexpected={len(unexpected)}.\n"

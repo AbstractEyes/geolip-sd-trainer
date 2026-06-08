@@ -73,9 +73,15 @@ def load_native_sdxl_unet(repo_or_path: str = SDXL_REPO, variant: str = "fp16",
     """
     if cfg is None:
         cfg = config_from_hf(repo_or_path, token) if read_config_from_hub else SDXLUNetConfig()
-    model = NativeSDXLUNet(cfg)
     sd = _load_state_dict(repo_or_path, variant, token)
-    missing, unexpected = model.load_state_dict(sd, strict=False)   # strict checks below (clearer error)
+    # Build on the meta device so the ~2.5B params are never random-initialized on CPU
+    # (that init + the immediate overwrite is pure waste and doubles peak host memory).
+    # assign=True swaps the checkpoint tensors straight in; the native tree is parameter-
+    # only (no registered buffers), so the strict check below also guarantees nothing is
+    # left stranded on meta.
+    with torch.device("meta"):
+        model = NativeSDXLUNet(cfg)
+    missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)   # strict checks below (clearer error)
     if missing or unexpected:
         raise RuntimeError(
             f"SDXL UNet load mismatch — missing={len(missing)} unexpected={len(unexpected)}.\n"

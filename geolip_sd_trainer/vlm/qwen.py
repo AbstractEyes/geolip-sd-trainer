@@ -181,19 +181,31 @@ def build_qwen(cfg: Optional[QwenConfig] = None, device: str = "cuda",
     cfg = cfg or QwenConfig()
     qwen_preflight(cfg)
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    common = dict(trust_remote_code=cfg.trust_remote_code, torch_dtype=dtype, token=token)
     try:
         tok = AutoTokenizer.from_pretrained(cfg.repo, trust_remote_code=cfg.trust_remote_code, token=token)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "left"
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.repo, trust_remote_code=cfg.trust_remote_code, torch_dtype=dtype, token=token)
+        # low_cpu_mem_usage loads via meta+assign (no random-init); device_map places the
+        # weights straight on the GPU, skipping the CPU→GPU copy and the ~2x peak host-RAM
+        # spike that OOMs free Colab. device_map needs `accelerate`; if it's missing we fall
+        # back to a plain load + .to(device) (still correct, just the slower path).
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.repo, low_cpu_mem_usage=True,
+                device_map=({"": device} if device != "cpu" else None), **common)
+            placed = device != "cpu"
+        except (ImportError, NotImplementedError):
+            model, placed = AutoModelForCausalLM.from_pretrained(cfg.repo, **common), False
     except (KeyError, ValueError) as e:
         raise SystemExit(
             f"\nCould not build Qwen3.5 from '{cfg.repo}' with the installed transformers "
             f"({e}).\nThis usually means transformers is too old for the Qwen3.5 architecture.\n"
             f"  pip install -U 'transformers{'>=' + cfg.min_transformers if cfg.min_transformers else ''}'  "
             "then restart the runtime.")
-    model = model.to(device).eval()
+    if not placed:
+        model = model.to(device)
+    model = model.eval()
     model.requires_grad_(False)
     return QwenPooledEncoder(model, tok, cfg)

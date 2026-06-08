@@ -24,6 +24,7 @@ Author: AbstractPhil + Mirel | License: MIT
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -65,14 +66,25 @@ def load_trainable_into(module: nn.Module, state: Dict[str, torch.Tensor],
 # save / load / resume
 # ============================================================================
 
+_SEP = "::"                 # module/param delimiter in the flat safetensors keymap
+
+
 def save_checkpoint(path, modules: Dict[str, nn.Module], optimizer=None, scheduler=None,
-                    scaler=None, meta: Optional[dict] = None) -> str:
+                    scaler=None, meta: Optional[dict] = None, save_optimizer: bool = True) -> str:
     """Save trainable params of each named module + training state + meta.
-    modules e.g. {'unet': unet, 'frontend': frontend}."""
+    modules e.g. {'unet': unet, 'frontend': frontend}.
+
+    A `.safetensors` path writes the modern layout: trainable tensors -> safetensors
+    (mmap-able, no pickle), meta -> a `.meta.json` sidecar, and optimizer/scheduler/scaler
+    -> a `.opt.pt` sidecar ONLY when save_optimizer=True (full-finetune AdamW state is ~2x
+    the params; re-warming on resume is cheap, so it's opt-out by default). A `.pt` path
+    keeps the legacy single-pickle format for backward compatibility."""
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    if str(path).endswith(".safetensors"):
+        return _save_safetensors_ckpt(path, modules, optimizer, scheduler, scaler, meta, save_optimizer)
     payload = {
         "modules": {k: trainable_state_dict(m) for k, m in modules.items()},
-        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "optimizer": optimizer.state_dict() if (save_optimizer and optimizer is not None) else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "meta": meta or {},
@@ -82,9 +94,42 @@ def save_checkpoint(path, modules: Dict[str, nn.Module], optimizer=None, schedul
     return str(path)
 
 
+def _save_safetensors_ckpt(path: Path, modules, optimizer, scheduler, scaler, meta, save_optimizer) -> str:
+    from safetensors.torch import save_file
+    flat = {}
+    for mname, m in modules.items():
+        for pname, p in trainable_state_dict(m).items():
+            flat[f"{mname}{_SEP}{pname}"] = p.contiguous()
+    st_meta = {"format": "geolip-ckpt-1", "modules": json.dumps(list(modules.keys())),
+               "epoch": str((meta or {}).get("epoch", 0)), "gstep": str((meta or {}).get("gstep", 0))}
+    tmp = str(path) + ".tmp"
+    save_file(flat, tmp, metadata=st_meta); os.replace(tmp, path)
+    _atomic_json(path.with_suffix(".meta.json"), meta or {})
+    opt_sidecar = Path(str(path) + ".opt.pt")
+    if save_optimizer and (optimizer is not None or scheduler is not None or scaler is not None):
+        torch.save({"optimizer": optimizer.state_dict() if optimizer is not None else None,
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                    "scaler": scaler.state_dict() if scaler is not None else None},
+                   str(opt_sidecar) + ".tmp")
+        os.replace(str(opt_sidecar) + ".tmp", opt_sidecar)
+    else:
+        opt_sidecar.unlink(missing_ok=True)                # stale state from a prior run
+    return str(path)
+
+
+def _atomic_json(path: Path, obj):
+    tmp = str(path) + ".tmp"
+    Path(tmp).write_text(json.dumps(obj, default=str))
+    os.replace(tmp, path)
+
+
 def load_checkpoint(path, modules: Dict[str, nn.Module], optimizer=None, scheduler=None,
                     scaler=None, map_location="cpu", strict: bool = False) -> dict:
-    """Restore trainable params into each named module + training state. Returns meta."""
+    """Restore trainable params into each named module + training state. Returns meta.
+    Auto-detects the safetensors layout vs the legacy pickle (.pt)."""
+    path = Path(path)
+    if str(path).endswith(".safetensors") or path.with_suffix(".meta.json").exists():
+        return _load_safetensors_ckpt(path, modules, optimizer, scheduler, scaler, map_location, strict)
     ck = torch.load(path, map_location=map_location, weights_only=False)
     for k, m in modules.items():
         if k in ck["modules"]:
@@ -98,16 +143,53 @@ def load_checkpoint(path, modules: Dict[str, nn.Module], optimizer=None, schedul
     return ck.get("meta", {})
 
 
-def find_latest_checkpoint(ckpt_dir, pattern: str = "ckpt_e*.pt") -> Optional[Path]:
-    files = sorted(Path(ckpt_dir).glob(pattern))
+def _load_safetensors_ckpt(path: Path, modules, optimizer, scheduler, scaler, map_location, strict) -> dict:
+    from safetensors.torch import load_file
+    dev = "cpu" if map_location in (None, "cpu") else str(map_location)
+    flat = load_file(str(path), device=dev)
+    per_module: Dict[str, Dict[str, torch.Tensor]] = {}
+    for k, v in flat.items():
+        mname, pname = k.split(_SEP, 1)
+        per_module.setdefault(mname, {})[pname] = v
+    for mname, m in modules.items():
+        if mname in per_module:
+            load_trainable_into(m, per_module[mname], strict=strict)
+    opt_sidecar = Path(str(path) + ".opt.pt")
+    if opt_sidecar.exists():
+        sd = torch.load(opt_sidecar, map_location=map_location, weights_only=False)
+        if optimizer is not None and sd.get("optimizer"):
+            optimizer.load_state_dict(sd["optimizer"])
+        if scheduler is not None and sd.get("scheduler"):
+            scheduler.load_state_dict(sd["scheduler"])
+        if scaler is not None and sd.get("scaler"):
+            scaler.load_state_dict(sd["scaler"])
+    meta_path = path.with_suffix(".meta.json")
+    return json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+
+def _primary_ckpts(ckpt_dir, patterns=("ckpt_e*.safetensors", "ckpt_e*.pt")) -> List[Path]:
+    """Primary checkpoint files (both formats), excluding sidecars (.opt.pt/.meta.json)."""
+    out: List[Path] = []
+    for pat in patterns:
+        out += [f for f in Path(ckpt_dir).glob(pat)
+                if not (f.name.endswith(".opt.pt") or f.name.endswith(".meta.json"))]
+    # name carries the zero-padded epoch, so lexical sort == epoch order
+    return sorted(out, key=lambda p: p.name)
+
+
+def find_latest_checkpoint(ckpt_dir, pattern: Optional[str] = None) -> Optional[Path]:
+    files = _primary_ckpts(ckpt_dir) if pattern is None else sorted(Path(ckpt_dir).glob(pattern))
     return files[-1] if files else None
 
 
-def rotate_checkpoints(ckpt_dir, keep_last: int, pattern: str = "ckpt_e*.pt"):
-    """Delete oldest local checkpoints beyond keep_last (storage hygiene)."""
-    files = sorted(Path(ckpt_dir).glob(pattern))
-    for f in files[:-keep_last] if keep_last > 0 else []:
+def rotate_checkpoints(ckpt_dir, keep_last: int):
+    """Delete oldest local checkpoints (and their sidecars) beyond keep_last."""
+    if keep_last <= 0:
+        return
+    for f in _primary_ckpts(ckpt_dir)[:-keep_last]:
         f.unlink(missing_ok=True)
+        Path(str(f) + ".opt.pt").unlink(missing_ok=True)
+        f.with_suffix(".meta.json").unlink(missing_ok=True)
 
 
 def export_unet_safetensors(path, unet: nn.Module):

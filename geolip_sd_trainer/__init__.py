@@ -29,10 +29,11 @@ the component loaders, so importing this package stays light (torch + numpy only
 """
 __version__ = "0.1.0"
 
+from . import dist
 from .model import (
     GeolipSDXL, SDXLModelConfig, ComponentConfig, ConditioningConfig,
     SDXLQwenFrontEnd, conditioning_from_preset, CONDITIONING_PRESETS,
-    PHASE1_RECIPE, build_sdxl, TRAIN_COMPONENTS, ENCODER_COMPONENTS, ALL_COMPONENTS,
+    PHASE1_RECIPE, build_sdxl, prefetch_models, TRAIN_COMPONENTS, ENCODER_COMPONENTS, ALL_COMPONENTS,
 )
 from .trainer import (
     Phase1Config, Phase1Trainer, train, build_cache, CachedDS,
@@ -49,7 +50,8 @@ __all__ = [
     # assembly
     "GeolipSDXL", "SDXLModelConfig", "ComponentConfig", "ConditioningConfig",
     "SDXLQwenFrontEnd", "conditioning_from_preset", "CONDITIONING_PRESETS",
-    "PHASE1_RECIPE", "build_sdxl", "TRAIN_COMPONENTS", "ENCODER_COMPONENTS", "ALL_COMPONENTS",
+    "PHASE1_RECIPE", "build_sdxl", "prefetch_models", "dist",
+    "TRAIN_COMPONENTS", "ENCODER_COMPONENTS", "ALL_COMPONENTS",
     # training
     "Phase1Config", "Phase1Trainer", "train", "build_cache", "CachedDS",
     "fm_targets", "euler_sample", "DropoutSchedule", "RUN_SHIFTS",
