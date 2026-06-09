@@ -32,6 +32,15 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.4"]
+# columnar cache prep / download (parquet shards). pyarrow ships with `datasets`,
+# listed explicitly for clarity.
+data = ["pyarrow>=14"]
+# image generation (Script C): Qwen-Image-Lightning + the geolip-aleph-void encoder.
+generate = [
+    "diffusers>=0.31",
+    "accelerate>=0.26",
+    "geolip-svae @ git+https://github.com/AbstractEyes/geolip-svae.git",
+]
 
 [project.urls]
 Homepage = "https://github.com/AbstractEyes/geolip-sd-trainer"

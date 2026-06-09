@@ -112,6 +112,26 @@ def test_dist_single_process_defaults():
     dist.barrier()                              # no-op, must not raise
 
 
+def test_cache_binary_roundtrip():
+    """The columnar-cache binary contract: encode_f16 -> decode_f16 is lossless at fp16,
+    and decode_trainer_npz reconstructs the 6 trainer arrays with the right shapes."""
+    from geolip_sd_trainer.data.cache_format import (
+        encode_f16, decode_f16, decode_trainer_npz, make_specs, TRAINER_KEYS)
+    a = (np.random.randn(32, 128)).astype(np.float16)
+    b = decode_f16(encode_f16(a), (32, 128))
+    assert b.dtype == np.float16 and b.shape == (32, 128) and np.array_equal(a, b)
+
+    specs = make_specs(qwen_hidden=1024)
+    row = {k: encode_f16(np.random.randn(*shp).astype(np.float16)) for k, (_, shp) in specs.items()}
+    six = decode_trainer_npz(row)
+    assert set(six) == set(TRAINER_KEYS)
+    assert six["lat"].shape == (4, 128, 128)
+    assert six["clipl"].shape == (77, 768) and six["clipg"].shape == (77, 1280)
+    assert six["clipgp"].shape == (1280,) and six["addr"].shape == (32, 128)
+    assert six["qpool"].shape == (1024,)        # hidden inferred from bytes
+    assert all(v.dtype == np.float16 for v in six.values())
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

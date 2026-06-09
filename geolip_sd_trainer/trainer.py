@@ -66,6 +66,10 @@ class Phase1Config:
     cache_dir: str = "./phase1_cache"
     n_images: int = 0                       # 0 = full (~86k); >0 caps for smoke tests
     n_addr: int = 32
+    # cache source: "local" encodes phase0 here; "hf_materialize" downloads the prepared
+    # columnar cache to local .npz; "hf_stream" reads it straight from HF (no local copy)
+    cache_mode: str = "local"
+    hf_cache_repo: str = "AbstractPhil/sdxl-qwen-phase1-cache"
 
     # recipe / components
     conditioning_preset: str = PHASE1_RECIPE
@@ -531,9 +535,26 @@ class Phase1Trainer:
     # -- setup: cache -> model -> trainable set -> optimizer/schedules --
     def setup(self):
         cfg = self.cfg
-        self.ids = build_cache(cfg)
-        dist.barrier()                                               # all ranks see the merged cache
-        self.ds = CachedDS(cfg.cache_dir, self.ids)
+        # --- dataset: local-encode cache, HF-materialized cache, or direct HF stream ---
+        if cfg.cache_mode == "hf_stream":
+            from .data.download_cache import HFColumnarDS
+            self.ds = HFColumnarDS(cfg.hf_cache_repo, n_images=cfg.n_images, token=self.token)
+            self.ids = None
+            qwen_hidden = self.ds.qwen_hidden
+        else:
+            if cfg.cache_mode == "hf_materialize":
+                from .data.download_cache import materialize, DownloadCacheConfig
+                materialize(DownloadCacheConfig(repo=cfg.hf_cache_repo, cache_dir=cfg.cache_dir,
+                                                n_images=cfg.n_images, device=cfg.device,
+                                                token=self.token))
+                self.ids = json.loads(manifest_path(cfg.cache_dir, cfg.n_images).read_text())
+            else:                                                    # "local": encode from phase0
+                self.ids = build_cache(cfg)
+            dist.barrier()                                           # all ranks see the cache
+            self.ds = CachedDS(cfg.cache_dir, self.ids)
+            with np.load(_cache_path(cfg.cache_dir, self.ids[0])) as z:
+                qwen_hidden = int(z["qpool"].shape[-1])
+
         # multi-pod: a DistributedSampler partitions the rows across ranks (each step is a
         # distinct shard) and we average gradients manually after backward (see _sync_grads).
         self.sampler = (torch.utils.data.distributed.DistributedSampler(
@@ -546,8 +567,6 @@ class Phase1Trainer:
         self.steps_per_epoch = len(self.loader)
         self.total_steps = self.steps_per_epoch * cfg.num_epochs
 
-        with np.load(_cache_path(cfg.cache_dir, self.ids[0])) as z:
-            qwen_hidden = int(z["qpool"].shape[-1])
         mcfg = SDXLModelConfig(
             components=cfg.components,
             conditioning=conditioning_from_preset(cfg.conditioning_preset, n_addr=cfg.n_addr),

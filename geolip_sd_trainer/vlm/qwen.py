@@ -166,6 +166,35 @@ class QwenPooledEncoder:
         chunks = [self.encode(texts[i:i + batch_size]) for i in range(0, len(texts), batch_size)]
         return torch.cat(chunks, dim=0) if chunks else torch.empty(0, self.hidden)
 
+    @torch.no_grad()
+    def encode_full(self, texts: List[str], pad_T: int = 512) -> dict:
+        """Rich encode for the columnar training cache. Returns, all on CPU:
+          pooled   [B, hidden] fp32   — last-token pool (same as encode())
+          qseq     [B, pad_T, hidden] fp32 — full layer-`cfg.layer` hidden states,
+                   LEFT-PADDED to pad_T (real tokens at the tail; slice qseq[pad_T-seq_len:])
+          seq_len  [B] int            — real (non-pad) token count, clamped to pad_T
+          gen_text list[str]          — the text actually encoded (the two-shot
+                   re-description when cfg.generate, else the caption verbatim)
+        Mirrors the AbstractPhil/sdxl-qwen-phase1-cache contract (pad_T=512, layer=-1)."""
+        to_encode = self._generate_batch(texts) if self.cfg.generate else list(texts)
+        gen_text = list(to_encode)
+        wrapped = [self._chat(t, as_generation=False) for t in to_encode]
+        enc = self.tok(wrapped, return_tensors="pt", padding=True, truncation=True,
+                       max_length=self.cfg.max_length).to(self.model.device)
+        out = self.model(**enc, output_hidden_states=True, return_dict=True)
+        hid = out.hidden_states[self.cfg.layer]                     # [B, T, hidden] (left-padded)
+        am = enc["attention_mask"]                                  # [B, T]
+        pooled = last_token_pool(hid, am)                           # [B, hidden]
+        real = am.sum(dim=1).clamp(max=pad_T).to(torch.int64)       # [B] real token count
+        B, T, H = hid.shape
+        qseq = hid.new_zeros(B, pad_T, H)
+        for i in range(B):                                          # place real tokens at the tail
+            n = int(real[i])
+            if n > 0:
+                qseq[i, pad_T - n:] = hid[i, T - n:]
+        return {"pooled": pooled.float().cpu(), "qseq": qseq.float().cpu(),
+                "seq_len": real.cpu(), "gen_text": gen_text}
+
     __call__ = encode
 
 

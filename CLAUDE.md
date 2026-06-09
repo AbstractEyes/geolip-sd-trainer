@@ -25,9 +25,34 @@ geolip_sd_trainer/
   trainer.py                               Phase1 trainer: build_cache, fit, eval, sampler
   checkpoint.py                            save/load/resume (safetensors) + HF upload
   dist.py                                  multi-pod seam (rank/world_size/barrier/...)
-run_phase1.py                              single/multi-pod launcher (env-configurable)
+  data/  cache_format.py hf_io.py          columnar cache contract + HF dataset writer
+         prepare_cache.py download_cache.py   Script A (build cache) / B (consume cache)
+         aleph.py generate.py                 geolip-aleph-void + Script C (gen images)
+run_phase1.py                              single/multi-pod TRAIN launcher
+prepare_cache.py download_cache.py generate_data.py   data-pipeline launchers
 tests/test_optimizations.py               fast CPU checks (cache + checkpoint round-trips)
 ```
+
+## Data pipeline (two dataset formats)
+
+Two HF dataset formats, both sharded for multi-GPU via RANK/WORLD_SIZE — full guide:
+[docs/DATA_PIPELINE.md](docs/DATA_PIPELINE.md).
+
+- **phase0** (`AbstractPhil/sdxl-qwen-phase0`): raw `image`(1024² JPEG) + `caption` +
+  `aleph_address`(Array2D [32,128] f16).
+- **phase1-cache** (`AbstractPhil/sdxl-qwen-phase1-cache`): prepared 11-column columnar
+  cache — 7 tensor columns are raw little-endian fp16 bytes in parquet `binary` columns
+  (`lat/clipl/qpool/clipg/clipgp/addr` + `qseq[512,1024]` left-padded), plus
+  `rid/caption/gen_text/seq_len`; 256 rows/shard, zstd. Contract = `data/cache_format.py`
+  (verified against the dataset's `meta.json`).
+
+Scripts (each shards by rank, writes disjoint shards, append-or-retarget):
+- `python prepare_cache.py` — phase0 → columnar cache (encoders + Qwen `qseq`/`gen_text`).
+- `python download_cache.py` — cache → local `.npz` (trainer short-circuits) **or** train
+  with `Phase1Config(cache_mode="hf_stream"|"hf_materialize", hf_cache_repo=...)`.
+- `python generate_data.py` — Qwen-Image-Lightning 4-step → new phase0 rows + aleph
+  (`data/aleph.py` loads `AbstractPhil/geolip-aleph-void` via the `geolip-svae` package).
+  Needs the `[generate]` extra (diffusers + geolip-svae).
 
 ## Environment setup (both Colab and RunPod)
 

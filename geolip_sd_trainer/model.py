@@ -305,6 +305,12 @@ class GeolipSDXL:
     def encode_qwen(self, captions) -> torch.Tensor:
         return self.qwen.encode(list(captions))                         # [B, qwen_hidden] cpu fp32
 
+    @torch.no_grad()
+    def encode_qwen_full(self, captions, pad_T: int = 512) -> dict:
+        """Rich Qwen encode for the columnar cache: pooled + full left-padded sequence
+        (qseq[pad_T,hidden]) + real seq_len + the generated re-description (gen_text)."""
+        return self.qwen.encode_full(list(captions), pad_T=pad_T)
+
     def build_conditioning(self, qwen_pool, clip_l_seq, clip_g_seq, clip_g_pool, address):
         return self.frontend(qwen_pool, clip_l_seq, clip_g_seq, clip_g_pool, address)
 
