@@ -27,7 +27,7 @@ Activation points (the public surface):
 The heavy native modules (transformer/, vae/, text_encoder/) load lazily through
 the component loaders, so importing this package stays light (torch + numpy only).
 """
-__version__ = "0.1.0"
+__version__ = "0.7.0"
 
 from . import dist
 from .model import (

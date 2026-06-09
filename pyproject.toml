@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geolip-sd-trainer"
-version = "0.1.0"
+version = "0.7.0"
 description = "Pure-PyTorch SDXL trainer with Qwen-pooled + aleph conditioning on the Lune rectified-flow objective"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,7 @@ dependencies = [
     "datasets>=2.19",
     "huggingface_hub>=0.26",
     "clean-fid>=0.1.35",
+    "geolip-svae @ git+https://github.com/AbstractEyes/geolip-svae.git",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +40,6 @@ data = ["pyarrow>=14"]
 generate = [
     "diffusers>=0.31",
     "accelerate>=0.26",
-    "geolip-svae @ git+https://github.com/AbstractEyes/geolip-svae.git",
 ]
 
 [project.urls]
