@@ -123,13 +123,15 @@ RANK=<r> WORLD_SIZE=<N> GEOLIP_TARGET_REPO=<you>/sdxl-qwen-phase0 \
 - **Models:** base `Qwen/Qwen-Image` + `lightx2v/Qwen-Image-Lightning`
   (`Qwen-Image-Lightning-4steps-V2.0.safetensors`), `num_inference_steps=4`,
   `true_cfg_scale=1.0`, Lightning `FlowMatchEulerDiscreteScheduler`. Render 1328² → 1024².
-- **Aleph:** [`data/aleph.py`](../geolip_sd_trainer/data/aleph.py) loads
-  `AbstractPhil/geolip-aleph-void` (`hf_version="aleph_byte_trigram_tied_hard_K64"`) via the
-  `geolip-svae` package, renders the caption to a byte-trigram image (`text_to_image`), and
-  reads the `[32,128]` address from the model. The exact tensor/aggregation is configurable
-  (`AlephConfig.source` / `aggregate` / `post`) so you can pin it to match the existing 86k
-  rows; defaults to `aleph_logits` + patch-mean. **If generated addresses don't match
-  phase0's value distribution (~[-1,1]), set `post="tanh"`** or adjust the checkpoint.
+- **Aleph (recipe confirmed against `geolip-svae/aleph_model.py` + its CLAUDE.md):**
+  [`data/aleph.py`](../geolip_sd_trainer/data/aleph.py) loads `AbstractPhil/geolip-aleph-void`
+  (`hf_version="aleph_byte_trigram_tied_hard_K64"`) via the `geolip-svae` package, renders the
+  caption to a byte-trigram image (`text_to_image`), runs `AlephModel.eval()`, takes
+  `out['svd']['aleph_logits']` `(B,N,32,128)`, and **mean-pools over the N patches** →
+  `[32,128]`. `aleph_logits = cat([cos, -cos])` are cosine similarities in **[-1,1]** (no extra
+  nonlinearity), matching phase0's `aleph_address` range — so `source="logits"`,
+  `aggregate="mean"`, `post="none"` are the pinned defaults. They stay configurable on
+  `AlephConfig` only in case a future cache uses a different checkpoint/aggregation.
 - **Multi-GPU:** Qwen-Image has no tensor-parallel — each rank runs a full pipeline on
   `cuda:LOCAL_RANK`, takes `prompts[rank::world_size]`, and writes disjoint rank-namespaced
   shards. Set `GEOLIP_CPU_OFFLOAD=1` for smaller-VRAM GPUs.

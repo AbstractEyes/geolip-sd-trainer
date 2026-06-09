@@ -5,17 +5,19 @@ Thin wrapper over the `geolip-svae` package (code) + the `AbstractPhil/geolip-al
 HF repo (weights), producing the byte-trigram aleph address that phase0 stores in its
 `aleph_address` column.
 
-Pipeline (matches the package's text path):
+Recipe (confirmed against geolip-svae aleph_model.py + the package CLAUDE.md):
   caption --text_to_image--> byte-trigram image (C,H,W)
-          --AlephModel(eval)--> out['svd']['aleph_logits']  (B, N, V=32, 2K=128)
-          --aggregate over patches N--> [B, 32, 128]
+          --AlephModel.eval()--> out['svd']['aleph_logits']  (B, N, V=32, 2K=128)
+          --mean over patches N--> [B, 32, 128]
+
+`aleph_logits = cat([cos, -cos], dim=-1)` where `cos = M_rows @ A.t()` are cosine
+similarities between sphere-normalized rows and the codebook axes — so values lie in
+[-1, 1], which matches phase0's observed aleph_address range (~[-0.95, 0.92]). No extra
+nonlinearity is applied (`post="none"`), and the package's default patch aggregation is
+`mean`. These are therefore the defaults below; `source`/`aggregate`/`post` remain
+configurable in case a future cache uses a different checkpoint or aggregation.
 
 Install:  pip install "git+https://github.com/AbstractEyes/geolip-svae.git"
-
-The exact tensor + aggregation that produced the existing 86k phase0 addresses is
-configurable (`source`, `aggregate`, `post`) so you can pin it to match; the defaults
-(logits + patch-mean) yield the [32,128] shape. If a generated batch's value distribution
-doesn't match phase0 (~[-1, 1]), try `post="tanh"` or `source="m_hat"`.
 
 Author: AbstractPhil + Mirel | License: MIT
 """
@@ -36,9 +38,9 @@ class AlephConfig:
     patch_size: int = 2
     pad: str = "space"
     channels: int = 3
-    source: str = "logits"            # "logits" (V,2K)->[32,128] | "m_hat" (V,D) flattened
-    aggregate: str = "mean"           # over patches N: "mean" | "first"
-    post: str = "none"                # "none" | "tanh" (bound to ~[-1,1] like phase0)
+    source: str = "logits"            # CONFIRMED: aleph_logits=cat([cos,-cos]) -> [V=32, 2K=128]
+    aggregate: str = "mean"           # CONFIRMED: package default = mean over all N patches
+    post: str = "none"                # cos is already in [-1,1]; "tanh" only if a cache differs
     device: str = "cuda"
 
 
@@ -65,11 +67,12 @@ class AlephEncoder:
             pass
         self.device = dev
         self._pdtype = next(self.model.parameters()).dtype
-        # geometry from the checkpoint config (fall back to defaults from text.py)
+        # geometry: model attributes are authoritative (patch_size/channels are set at build);
+        # img_size is the byte-trigram render size from the checkpoint config (else default).
         g = self.mcfg if isinstance(self.mcfg, dict) else {}
+        self.patch_size = int(getattr(self.model, "patch_size", g.get("patch_size", self.cfg.patch_size)))
+        self.channels = int(getattr(self.model, "channels", g.get("channels", self.cfg.channels)))
         self.img_size = int(g.get("img_size", self.cfg.img_size))
-        self.patch_size = int(g.get("patch_size", self.cfg.patch_size))
-        self.channels = int(g.get("channels", self.cfg.channels))
 
     @torch.no_grad()
     def caption_to_aleph(self, captions: List[str]) -> np.ndarray:
